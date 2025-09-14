@@ -57,16 +57,33 @@ class FlashAttention2Function(torch.autograd.Function):
                         
                         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
                         # 1. Apply causal masking if is_causal is True.
-                        #
+                        if is_causal == True:
+                            q_ind = torch.arange(q_start, q_end, device=Q.device).unsqueeze(1)
+                            k_ind = torch.arange(k_start, k_end, device=Q.device).unsqueeze(0)
+                            # tl.static_print("q_ind, k_ind: ", q_ind, k_ind)
+                            causal_mask = k_ind > q_ind
+                            S_ij = torch.where(causal_mask, -float('inf'), S_ij)
+                            # tl.static_print("S_ij: ", S_ij)                        
                         # 2. Compute the new running maximum
-                        #
+                        m_new = torch.maximum(m_i, S_ij.max(dim=-1).values)
+                        
                         # 3. Rescale the previous accumulators (o_i, l_i)
-                        #
+                        exp_diff = torch.exp(m_i - m_new)
+                        o_i = o_i * exp_diff.unsqueeze(-1)
+                        l_i = l_i * exp_diff
+                        # tl.static_print("o_i, l_i: ", o_i, l_i)
+                        
                         # 4. Compute the probabilities for the current tile, P_tilde_ij = exp(S_ij - m_new).
-                        #
+                        P_tilde_ij = torch.exp(S_ij - m_new.unsqueeze(-1)).to(Q.dtype)
+                        # tl.static_print("P_tilde_ij: ", P_tilde_ij)
+                        
                         # 5. Accumulate the current tile's contribution to the accumulators to update l_i and o_i
-                        #
+                        l_i += P_tilde_ij.sum(dim=-1)
+                        o_i += P_tilde_ij @ V_tile
+                        # tl.static_print("o_i: ", o_i)
+                        
                         # 6. Update the running max for the next iteration
+                        m_i = m_new
                         
                         # --- END OF STUDENT IMPLEMENTATION ---
 

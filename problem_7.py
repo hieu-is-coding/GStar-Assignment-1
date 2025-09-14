@@ -4,6 +4,66 @@ import triton.language as tl
 import math
 
 @triton.jit
+def process_kv_block(
+    start_n, acc, m_i, l_i,
+    q_block, q_offsets, qk_scale,
+    K_ptr, V_ptr,
+    batch_idx, kv_head_idx,
+    k_stride_b, k_stride_h, k_stride_s,
+    v_stride_b, v_stride_h, v_stride_s,
+    SEQ_LEN, 
+    HEAD_DIM, 
+    BLOCK_M: tl.constexpr, 
+    BLOCK_N: tl.constexpr, 
+    WINDOW_SIZE: tl.constexpr, 
+    SINK_SIZE: tl.constexpr,
+    process_name,
+):
+    """A kernel function for less code lines"""
+    k_offsets = start_n + tl.arange(0, BLOCK_N)
+
+    k_valid = (k_offsets[None, :] >=0) & (k_offsets[None, :] < SEQ_LEN)
+    k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None]
+    k_block = tl.load(k_ptrs, mask=k_valid, other=0.0).to(tl.float32)
+    # tl.static_print(f"{process_name} - k_offsets, k_valid, k_ptrs, k_block: ", k_offsets, k_valid, k_ptrs, k_block)
+
+    v_valid = (k_offsets[:, None] >= 0) & (k_offsets[:, None] < SEQ_LEN)
+    v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :]
+    v_block = tl.load(v_ptrs, mask=v_valid, other=0.0).to(tl.float32)
+    # tl.static_print(f"{process_name} - v_valid, v_ptrs, v_block: ", v_valid, v_ptrs, v_block)
+
+    s_ij = tl.dot(q_block, k_block)
+    s_ij *= qk_scale
+    # tl.static_print(f"{process_name} - s_ij: ", s_ij)
+    # tl.static_print("s_ij shape:", s_ij.shape)
+
+    # Apply comnined masking
+    causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+    swa_mask = (q_offsets[:, None] - k_offsets[None, :]) <= (WINDOW_SIZE - 1)
+    sink_mask = k_offsets[None, :] < SINK_SIZE
+    combined_mask = k_valid & causal_mask & (swa_mask | sink_mask)
+    # combined_mask = k_valid & causal_mask & swa_mask & sink_mask
+    # tl.static_print(f"{process_name} - s_ij: ", combined_mask)
+    s_ij = tl.where(combined_mask, s_ij, -float('inf'))
+
+    # Reuse online softmax with small change in m_new update
+    row_max = tl.maximum(m_i, tl.max(s_ij, axis=1))
+    row_oke = row_max > -float('inf')
+    m_new = tl.maximum(row_oke, row_max)
+    exp_diff = tl.where(row_oke, tl.exp2(m_i - m_new), 1.0)
+    # tl.static_print(f"{process_name} - row_max, row_oke, m_new: ", row_max, row_oke, m_new)
+    acc = acc * exp_diff[:, None]
+    l_i = l_i * exp_diff
+    # tl.static_print(f"{process_name} - acc, l_i: ", acc, l_i)
+    p_ij = tl.where(row_oke[:, None], tl.exp2(s_ij - m_new[:, None]), 0.0)
+    # tl.static_print(f"{process_name} - p_ij: ", p_ij)
+    acc += tl.dot(p_ij, v_block)
+    l_i += tl.sum(p_ij, axis=1)
+    # tl.static_print(f"{process_name} - acc, l_i: ", acc, l_i)
+    m_i = m_new
+    return acc, m_i, l_i
+
+@triton.jit
 def _flash_attention_forward_swa_kernel(
     # Pointers to Tensors
     Q_ptr, K_ptr, V_ptr, O_ptr,
@@ -54,10 +114,49 @@ def _flash_attention_forward_swa_kernel(
     # Combine the GQA, SWA, and Sink logic.
     # Combine all code from previous problems, and add the sink logic.
     # You should have 3 phases:
+    # Set the correct start bound
+    window_start = tl.maximum(0, q_block_idx * BLOCK_M - (WINDOW_SIZE - 1))
+    window_start = (window_start // BLOCK_N) * BLOCK_N
+    # Set q_block to float32 for type matching
+    q_block = q_block.to(tl.float32)
+    
     # 1. Phase 0: Sink blocks that are before the sliding window
+    sink_end = tl.minimum(tl.minimum(SINK_SIZE, SEQ_LEN), window_start)
+    if sink_end > 0:
+        for start_n in range(0, sink_end, BLOCK_N):
+            acc, m_i, l_i = process_kv_block(
+                start_n, acc, m_i, l_i, 
+                q_block, q_offsets, qk_scale,
+                K_ptr, V_ptr, batch_idx, kv_head_idx,
+                k_stride_b, k_stride_h, k_stride_s,
+                v_stride_b, v_stride_h, v_stride_s,
+                SEQ_LEN, HEAD_DIM, BLOCK_M, BLOCK_N, WINDOW_SIZE, SINK_SIZE,
+                "Sink process"
+            )
+        # tl.static_print(acc, m_i, l_i)
     # 2. Phase 1: Off-Diagonal Blocks (within the window)
+    for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
+        acc, m_i, l_i = process_kv_block(
+            start_n, acc, m_i, l_i, 
+            q_block, q_offsets, qk_scale,
+            K_ptr, V_ptr, batch_idx, kv_head_idx,
+            k_stride_b, k_stride_h, k_stride_s,
+            v_stride_b, v_stride_h, v_stride_s,
+            SEQ_LEN, HEAD_DIM, BLOCK_M, BLOCK_N, WINDOW_SIZE, SINK_SIZE,
+            "Off-Diagonal Blocks"
+        )
     # 3. Phase 2: Diagonal Blocks
-    pass
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, tl.minimum((q_block_idx + 1) * BLOCK_M, SEQ_LEN), BLOCK_N):
+        acc, m_i, l_i = process_kv_block(
+            start_n, acc, m_i, l_i, 
+            q_block, q_offsets, qk_scale,
+            K_ptr, V_ptr, batch_idx, kv_head_idx,
+            k_stride_b, k_stride_h, k_stride_s,
+            v_stride_b, v_stride_h, v_stride_s,
+            SEQ_LEN, HEAD_DIM, BLOCK_M, BLOCK_N, WINDOW_SIZE, SINK_SIZE,
+            "Diagonal Blocks"
+        )
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.

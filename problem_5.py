@@ -34,9 +34,9 @@ def _flash_attention_forward_gqa_kernel(
     # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 1) ---
     # Your goal is to map the current query head (q_head_idx) to its corresponding shared key/value head (kv_head_idx).
     # 1. Calculate how many query heads are in each group.
+    heads_per_group = N_Q_HEADS // N_KV_HEADS
     # 2. Use integer division to find the correct kv_head_idx.
-    
-    kv_head_idx = 0 # Placeholder: Replace with your calculation
+    kv_head_idx = q_head_idx // heads_per_group
     # --- END OF STUDENT IMPLEMENTATION ---
 
 
@@ -57,9 +57,31 @@ def _flash_attention_forward_gqa_kernel(
     for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
         # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 2) ---
         # 1. Modify the pointer arithmetic for K and V to use your `kv_head_idx`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None]
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        # tl.static_print("Off-Diagonal Blocks - k_offsets, k_ptrs, k_block: ", k_offsets, k_ptrs, k_block)
+        
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :]
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        # tl.static_print("Off-Diagonal Blocks - v_ptrs, v_block: ", v_ptrs, v_block)
         # 2. Reuse your working implementation for the online softmax update
         #    from your solution to Problem 4.
-        pass
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        # tl.static_print("Off-Diagonal Blocks - s_ij: ", s_ij)
+        
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        exp_diff = tl.exp2(m_i - m_new)
+        acc = acc * exp_diff[:, None]
+        l_i = l_i * exp_diff
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        # tl.static_print("Off-Diagonal Blocks - p_ij: ", p_ij)
+        v_block = v_block.to(tl.float32)
+        acc += tl.dot(p_ij, v_block)
+        l_i += tl.sum(p_ij, axis=1)
+        # tl.static_print("Off-Diagonal Blocks - acc, l_i: ", acc, l_i)
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
     # --- Phase 2: Diagonal Blocks ---
@@ -67,9 +89,35 @@ def _flash_attention_forward_gqa_kernel(
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 3) ---
         # 1. Modify the pointer arithmetic for K and V to use your `kv_head_idx`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None]
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        # tl.static_print("Diagonal Blocks - k_offsets, k_ptrs, k_block: ", k_offsets, k_ptrs, k_block)
+        
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :]
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        # tl.static_print("Diagonal Blocks - v_ptrs, v_block: ", v_ptrs, v_block)
         # 2. Reuse your working implementation for the masked online softmax
         #    update from your solution to Problem 4.
-        pass
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        # tl.static_print("Diagonal Blocks - s_ij: ", s_ij)
+        
+        causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+        s_ij = tl.where(causal_mask, s_ij, -float('inf'))
+        
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        exp_diff = tl.exp2(m_i - m_new)
+        acc = acc * exp_diff[:, None]
+        l_i = l_i * exp_diff
+        # tl.static_print("Diagonal Blocks - acc, l_i: ", acc, l_i)
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        # tl.static_print("Diagonal Blocks - p_ij: ", p_ij)
+        v_block = v_block.to(tl.float32)
+        acc += tl.dot(p_ij, v_block)
+        l_i += tl.sum(p_ij, axis=1)
+        # tl.static_print("Diagonal Blocks - acc, l_i: ", acc, l_i)
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.

@@ -1,3 +1,4 @@
+from doctest import BLANKLINE_MARKER
 import torch
 import triton
 import triton.language as tl
@@ -34,9 +35,10 @@ def _flash_attention_forward_swa_kernel(
     # --- STUDENT IMPLEMENTATION REQUIRED (Part 1: GQA Logic) ---
     # This problem combines GQA and SWA. First, implement the GQA logic.
     # 1. Calculate the number of query heads per group.
+    heads_per_group = N_Q_HEADS // N_KV_HEADS
     # 2. Determine the correct kv_head_idx for the current q_head_idx.
-    
-    kv_head_idx = 0    # Placeholder: Replace with your GQA calculation
+    kv_head_idx = q_head_idx // heads_per_group
+    # tl.static_print("heads_per_group, kv_head_idx: ", heads_per_group, kv_head_idx)
     # --- END OF GQA IMPLEMENTATION ---
 
 
@@ -57,22 +59,97 @@ def _flash_attention_forward_swa_kernel(
     # Now, implement the "sliding window" by changing the loop bounds.
     # The kernel should only attend to the `WINDOW_SIZE` most recent key/value tokens.
     # 1. Calculate the starting position of the attention window (window_start).
+    window_start = tl.maximum(0, q_block_idx * BLOCK_M - WINDOW_SIZE)
+    # Align window_start with loop range as multiple of BLOCK_N
+    window_start = (window_start // BLOCK_N) * BLOCK_N
     # 2. Modify the range of the Phase 1 loop to start from your window_start.
-
-    window_start = 0 # Placeholder: Replace with your SWA calculation
 
     # --- Phase 1: Off-Diagonal Blocks (within the window) ---
     for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
         # Hint: You might need to apply the per-element sliding window mask to s_ij.
         #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
-        pass
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+
+        k_valid = (k_offsets[None, :] >=0) & (k_offsets[None, :] < SEQ_LEN)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None]
+        k_block = tl.load(k_ptrs, mask=k_valid, other=0.0)
+        # tl.static_print("Off-diagonal Blocks - k_offsets, k_valid, k_ptrs, k_block: ", k_offsets, k_valid, k_ptrs, k_block)
+
+        v_valid = (k_offsets[:, None] >= 0) & (k_offsets[:, None] < SEQ_LEN)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :]
+        v_block = tl.load(v_ptrs, mask=v_valid, other=0.0).to(tl.float32)
+        # tl.static_print("Off-diagonal Blocks - v_valid, v_ptrs, v_block: ", v_valid, v_ptrs, v_block)
+
+        s_ij = tl.dot(q_block, k_block).to(tl.float32)
+        s_ij *= qk_scale
+        # tl.static_print("Off-diagonal Blocks - s_ij: ", s_ij)
+
+        # Apply comnined masking
+        causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+        swa_mask = (q_offsets[:, None] - k_offsets[None, :]) <= (WINDOW_SIZE - 1)
+        combined_mask = k_valid & causal_mask & swa_mask
+        s_ij = tl.where(combined_mask, s_ij, -float('inf'))
+        # tl.static_print("Off-diagonal Blocks - s_ij: ", m_i, s_ij)
+
+        # Reuse online softmax
+        row_max = tl.max(s_ij, axis=1)
+        row_oke = row_max > -float('inf')
+        m_new = tl.maximum(row_oke, row_max)
+        exp_diff = tl.where(row_oke, tl.exp2(m_i - m_new), 1.0)
+        # tl.static_print("Off-diagonal Blocks - row_max, row_oke, m_new: ", row_max, row_oke, m_new)
+        acc = acc * exp_diff[:, None]
+        l_i = l_i * exp_diff
+        # tl.static_print("Off-diagonal Blocks - acc, l_i: ", acc, l_i)
+        p_ij = tl.where(row_oke[:, None], tl.exp2(s_ij - m_new[:, None]), 0.0)
+        # tl.static_print("Off-diagonal Blocks - p_ij: ", p_ij)
+        acc += tl.dot(p_ij, v_block)
+        l_i += tl.sum(p_ij, axis=1)
+        # tl.static_print("Off-diagonal Blocks - acc, l_i: ", acc, l_i)
+        m_i = m_new
 
     # --- Phase 2: Diagonal Blocks ---
     diag_start = q_block_idx * BLOCK_M
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED
-        pass
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+
+        k_valid = (k_offsets[None, :] >=0) & (k_offsets[None, :] < SEQ_LEN)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None]
+        k_block = tl.load(k_ptrs, mask=k_valid, other=0.0)
+        # tl.static_print("Diagonal Blocks - k_offsets, k_valid, k_ptrs, k_block: ", k_offsets, k_valid, k_ptrs, k_block)
+
+        v_valid = (k_offsets[:, None] >= 0) & (k_offsets[:, None] < SEQ_LEN)
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :]
+        v_block = tl.load(v_ptrs, mask=v_valid, other=0.0).to(tl.float32)
+        # tl.static_print("Diagonal Blocks - v_valid, v_ptrs, v_block: ", v_valid, v_ptrs, v_block)
+
+        s_ij = tl.dot(q_block, k_block).to(tl.float32)
+        s_ij *= qk_scale
+        # tl.static_print("Diagonal Blocks - s_ij: ", s_ij)
+
+        # Apply comnined masking
+        causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+        swa_mask = (q_offsets[:, None] - k_offsets[None, :]) <= (WINDOW_SIZE - 1)
+        combined_mask = k_valid & causal_mask & swa_mask
+        s_ij = tl.where(combined_mask, s_ij, -float('inf'))
+        # tl.static_print("Diagonal Blocks - s_ij: ", m_i, s_ij)
+
+        # Reuse online softmax
+        row_max = tl.max(s_ij, axis=1)
+        row_oke = row_max > -float('inf')
+        m_new = tl.maximum(row_oke, row_max)
+        exp_diff = tl.where(row_oke, tl.exp2(m_i - m_new), 1.0)
+        # tl.static_print("Diagonal Blocks - row_max, row_oke, m_new: ", row_max, row_oke, m_new)
+        acc = acc * exp_diff[:, None]
+        l_i = l_i * exp_diff
+        # tl.static_print("Diagonal Blocks - acc, l_i: ", acc, l_i)
+        p_ij = tl.where(row_oke[:, None], tl.exp2(s_ij - m_new[:, None]), 0.0)
+        # tl.static_print("Diagonal Blocks - p_ij: ", p_ij)
+        acc += tl.dot(p_ij, v_block)
+        l_i += tl.sum(p_ij, axis=1)
+        # tl.static_print("Diagonal Blocks - acc, l_i: ", acc, l_i)
+        m_i = m_new
     # --- END OF SWA IMPLEMENTATION ---
 
 
@@ -103,8 +180,8 @@ def flash_attention_forward(q, k, v, is_causal=True, window_size=128):
     BLOCK_M, BLOCK_N = 128, 64
     grid = (triton.cdiv(seq_len, BLOCK_M), batch * n_q_heads)
 
-    if window_size != 4096:
-        raise ValueError("This kernel is compiled for a fixed window size of 4096")
+    # if window_size != 4096:
+    #     raise ValueError("This kernel is compiled for a fixed window size of 4096")
 
     _flash_attention_forward_swa_kernel[grid](
         q, k, v, o,
