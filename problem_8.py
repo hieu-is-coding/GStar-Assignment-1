@@ -44,8 +44,6 @@ def _flash_attention_forward_kernel(
     q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < seq_len, other=0.0).to(tl.float32)
     # tl.static_print("q_block: ", q_block)
 
-    qk_scale = softmax_scale
-
     # Phase 1: Off-diagonal blocks
     for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
         k_offsets = start_n + tl.arange(0, BLOCK_N)
@@ -62,7 +60,7 @@ def _flash_attention_forward_kernel(
         causal_mask = q_offsets[:, None] >= k_offsets[None, :]
         gqa_mask = causal_mask & k_valid[None, :]
         # tl.static_print("Off-Diagonal Blocks - gqa_mask: ", gqa_mask)
-        s_ij = tl.dot(q_block, k_block) * qk_scale
+        s_ij = tl.dot(q_block, k_block) * softmax_scale
         s_ij = tl.where(gqa_mask, s_ij, -float('inf'))
         # tl.static_print("Off-Diagonal Blocks - s_ij: ", s_ij)
 
@@ -82,7 +80,7 @@ def _flash_attention_forward_kernel(
         m_i = m_new
 
     # Phase 2: Diagonal blocks
-    diag_start = q_block_idx * BLOCK_M
+    diag_start = (q_block_idx * BLOCK_M) // BLOCK_N * BLOCK_N
     for start_n in range(diag_start, tl.minimum((q_block_idx + 1) * BLOCK_M, seq_len), BLOCK_N):
         k_offsets = start_n + tl.arange(0, BLOCK_N)
         k_valid = (k_offsets >= 0) & (k_offsets < seq_len)
@@ -98,7 +96,7 @@ def _flash_attention_forward_kernel(
         causal_mask = q_offsets[:, None] >= k_offsets[None, :]
         gqa_mask = causal_mask & k_valid[None, :]
         # tl.static_print("Diagonal Blocks - gqa_mask: ", gqa_mask)
-        s_ij = tl.dot(q_block, k_block) * qk_scale
+        s_ij = tl.dot(q_block, k_block) * softmax_scale
         s_ij = tl.where(gqa_mask, s_ij, -float('inf'))
         # tl.static_print("Diagonal Blocks - s_ij: ", s_ij)
 
@@ -121,8 +119,7 @@ def _flash_attention_forward_kernel(
     l_i_safe = tl.where(l_i == 0, 1.0, l_i)
     acc = acc / l_i_safe[:, None]
 
-    o_ptrs = o + batch_idx * o_stride_b + q_head_idx * o_stride_h + \
-             (q_offsets[:, None] * o_stride_s + tl.arange(0, head_dim)[None, :])
+    o_ptrs = o + batch_idx * o_stride_b + q_head_idx * o_stride_h + q_offsets[:, None] * o_stride_s + tl.arange(0, head_dim)[None, :]
     # tl.static_print("o_ptrs: ", o_ptrs)
     tl.store(o_ptrs, acc.to(o.dtype.element_ty), mask=q_offsets[:, None] < seq_len)
 
@@ -193,9 +190,8 @@ def _flash_attention_backward_kernel(
     dq_acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
 
     #   2. Recompute attention probabilities P = softmax(QK^T)
-    # Define end bound
-    end_n = tl.minimum((q_block_idx + 1) * BLOCK_M, seq_len)
-    for start_n in range(0, end_n, BLOCK_N):
+    # --- Phase 1: Off-Diagonal Blocks ---
+    for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
         k_offsets = start_n + tl.arange(0, BLOCK_N)
         k_valid = (k_offsets >= 0) & (k_offsets < seq_len)
 
@@ -219,6 +215,50 @@ def _flash_attention_backward_kernel(
         # tl.static_print("Backward - p_ij: ", p_ij)
 
         #   3. Use delta + dO to accumulate gradients for dq, dk, dv
+        outer = tl.dot(do_block, tl.trans(v_block))
+        # Compute gradient of scores (dS)
+        dS_ij = p_ij * (outer - delta_i)
+        # tl.static_print("Backward - dS_ij: ", dS_ij)
+
+        dq_acc += tl.dot(dS_ij, tl.trans(k_block)) * softmax_scale
+        # tl.static_print("Backward - dq_acc: ", dq_acc)
+
+        dk_ptrs = dk + batch_idx * dk_stride_b + kv_head_idx * dk_stride_h + k_offsets[None, :] * dk_stride_s + tl.arange(0, head_dim)[:, None]
+        dk_add = tl.dot(tl.trans(q_block), dS_ij) * softmax_scale
+        # tl.static_print("Backward - dk_ptrs, dk_add: ", dk_ptrs, dk_add)
+        tl.atomic_add(dk_ptrs, dk_add.to(dk.dtype.element_ty), mask=k_valid[None, :])
+
+        dv_ptrs = dv + batch_idx * dv_stride_b + kv_head_idx * dv_stride_h + k_offsets[:, None] * dv_stride_s + tl.arange(0, head_dim)[None, :]
+        dv_add = tl.dot(tl.trans(p_ij), do_block)
+        tl.atomic_add(dv_ptrs, dv_add.to(dv.dtype.element_ty), mask=k_valid[:, None])
+        # tl.static_print("Backward - dv_ptrs, dv_add: ", dv_ptrs, dv_add)
+
+    # --- Phase 2: Diagonal Blocks ---
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, tl.minimum((q_block_idx + 1) * BLOCK_M, seq_len), BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_valid = (k_offsets >= 0) & (k_offsets < seq_len)
+
+        k_ptrs = k + batch_idx * k_stride_b + kv_head_idx * k_stride_h + k_offsets[None, :] * k_stride_s + tl.arange(0, head_dim)[:, None]
+        k_block = tl.load(k_ptrs, mask=k_valid[None, :], other=0.0).to(tl.float32)
+        # tl.static_print("Backward - k_offsets, k_valid, k_ptrs, k_block: ", k_offsets, k_valid, k_ptrs, k_block)
+
+        v_ptrs = v + batch_idx * v_stride_b + kv_head_idx * v_stride_h + k_offsets[:, None] * v_stride_s + tl.arange(0, head_dim)[None, :]
+        v_block = tl.load(v_ptrs, mask=k_valid[:, None], other=0.0).to(tl.float32)
+        # tl.static_print("Backward - v_valid, v_ptrs, v_block: ", v_valid, v_ptrs, v_block)
+
+        # Apply gqa masking
+        causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+        gqa_mask = causal_mask & k_valid[None, :]
+        #  tl.static_print("Backward - gqa_mask: ", gqa_mask)
+        s_ij = tl.dot(q_block, k_block) * softmax_scale
+        s_ij = tl.where(gqa_mask, s_ij, -float('inf'))
+        #  tl.static_print("Backward - s_ij: ", s_ij.shape)
+
+        p_ij = tl.where(gqa_mask, tl.exp(s_ij - M_i[:, None]), 0.0)
+        # tl.static_print("Backward - p_ij: ", p_ij)
+
+        #  Use delta + dO to accumulate gradients for dq, dk, dv
         outer = tl.dot(do_block, tl.trans(v_block))
         # Compute gradient of scores (dS)
         dS_ij = p_ij * (outer - delta_i)

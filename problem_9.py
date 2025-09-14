@@ -98,7 +98,7 @@ def _flash_attention_forward_swa_kernel(
         m_i = m_new
 
     # Phase 2: Diagonal blocks
-    diag_start = q_block_idx * BLOCK_M
+    diag_start = (q_block_idx * BLOCK_M) // BLOCK_N * BLOCK_N
     for start_n in range(diag_start, tl.minimum((q_block_idx + 1) * BLOCK_M, SEQ_LEN), BLOCK_N):
         k_offsets = start_n + tl.arange(0, BLOCK_N)
         padding_mask = k_offsets < SEQ_LEN
@@ -149,8 +149,7 @@ def _flash_attention_forward_swa_kernel(
     l_i_safe = tl.where(l_i == 0, 1.0, l_i)
     acc = acc / l_i_safe[:, None]
     
-    o_ptrs = O_ptr + batch_idx * o_stride_b + q_head_idx * o_stride_h + \
-             (q_offsets[:, None] * o_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+    o_ptrs = O_ptr + batch_idx * o_stride_b + q_head_idx * o_stride_h + q_offsets[:, None] * o_stride_s + tl.arange(0, HEAD_DIM)[None, :]
     tl.store(o_ptrs, acc.to(O_ptr.dtype.element_ty), mask=q_mask[:, None])
 
     # Store log-sum-exp for backward pass
@@ -203,18 +202,15 @@ def _flash_attention_backward_swa_kernel(
     q_mask = q_offsets < SEQ_LEN
 
     # Load Q, dO, O, and LSE for the current query block
-    q_ptrs = Q_ptr + batch_idx * q_stride_b + q_head_idx * q_stride_h + \
-             (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+    q_ptrs = Q_ptr + batch_idx * q_stride_b + q_head_idx * q_stride_h + q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :]
     q_block = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0).to(tl.float32)
     # tl.static_print("Backward - q_block: ", q_block)
 
-    do_ptrs = dO_ptr + batch_idx * do_stride_b + q_head_idx * do_stride_h + \
-              (q_offsets[:, None] * do_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+    do_ptrs = dO_ptr + batch_idx * do_stride_b + q_head_idx * do_stride_h + q_offsets[:, None] * do_stride_s + tl.arange(0, HEAD_DIM)[None, :]
     do_block = tl.load(do_ptrs, mask=q_mask[:, None], other=0.0).to(tl.float32)
     # tl.static_print("Backward - do_block: ", do_block)
 
-    o_ptrs = O_ptr + batch_idx * o_stride_b + q_head_idx * o_stride_h + \
-             (q_offsets[:, None] * o_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+    o_ptrs = O_ptr + batch_idx * o_stride_b + q_head_idx * o_stride_h + q_offsets[:, None] * o_stride_s + tl.arange(0, HEAD_DIM)[None, :]
     o_block = tl.load(o_ptrs, mask=q_mask[:, None], other=0.0).to(tl.float32)
     # tl.static_print("Backward - o_block: ", o_block) 
 
@@ -229,9 +225,58 @@ def _flash_attention_backward_swa_kernel(
     dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     #   2. Recompute attention probabilities P = softmax(QK^T)
-    # Define end bound
-    end_n = tl.minimum((q_block_idx + 1) * BLOCK_M, SEQ_LEN)
-    for start_n in range(0, end_n, BLOCK_N):
+    for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        padding_mask = k_offsets < SEQ_LEN
+        # tl.static_print("Backward - padding_mask: ", padding_mask)
+
+        # Create the combined attention mask (Flash Attention + Sliding Attention + Attention Sinks)
+        check_sink = k_offsets[None, :] < SINK_SIZE
+        check_window = k_offsets[None, :]> (q_offsets[:, None] - WINDOW_SIZE)
+        causal_mask = k_offsets[None, :] <= q_offsets[:, None]
+        combined_mask = causal_mask & (check_sink | check_window)
+        combined_mask &= padding_mask[None, :]
+        # tl.static_print("Backward - combined_mask: ", combined_mask)
+
+        # Load K and V blocks
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        
+        k_block = tl.load(k_ptrs, mask=padding_mask[None, :], other=0.0).to(tl.float32)
+        v_block = tl.load(v_ptrs, mask=padding_mask[:, None], other=0.0).to(tl.float32)
+        # tl.static_print("Backward - k_block, v_block: ", k_block, v_block)
+
+        # Recompute attention scores (S) and probabilities (P)
+        s_ij = tl.dot(q_block, k_block) * softmax_scale
+        s_ij = tl.where(combined_mask, s_ij, -float('inf'))
+        #  tl.static_print("Backward - s_ij: ", s_ij.shape)
+
+        p_ij = tl.exp(s_ij - m_i[:, None])
+        # tl.static_print("Backward - p_ij: ", p_ij)
+
+        #   3. Use delta + dO to accumulate gradients for dq, dk, dv
+        # Compute gradient of scores (dS)
+        dS_ij_scaled = p_ij * (tl.dot(do_block, tl.trans(v_block)) - delta_i[:, None])
+
+        # Accumulate dQ
+        dq_acc += tl.dot(dS_ij_scaled, tl.trans(k_block)) * softmax_scale
+
+        # Compute and atomically add dK
+        dk_add = tl.dot(tl.trans(dS_ij_scaled), q_block) * softmax_scale
+        dk_ptrs = dK_ptr + batch_idx * dk_stride_b + kv_head_idx * dk_stride_h + k_offsets[:, None] * dk_stride_s + tl.arange(0, HEAD_DIM)[None, :]
+        # tl.static_print("Backward - dk_ptrs, dk_add: ", dk_ptrs, dk_add)
+        tl.atomic_add(dk_ptrs, dk_add, mask=padding_mask[:, None])
+
+        # Compute and atomically add dV
+        dv_add = tl.dot(tl.trans(p_ij.to(do_block.dtype)), do_block)
+        dv_ptrs = dV_ptr + batch_idx * dv_stride_b + kv_head_idx * dv_stride_h + k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :]
+        # tl.static_print("Backward - dv_ptrs, dv_add: ", dv_ptrs, dv_add)
+        tl.atomic_add(dv_ptrs, dv_add, mask=padding_mask[:, None])
+
+    diag_start = (q_block_idx * BLOCK_M) // BLOCK_N * BLOCK_N
+    for start_n in range(diag_start, tl.minimum((q_block_idx + 1) * BLOCK_M, SEQ_LEN), BLOCK_N):
         k_offsets = start_n + tl.arange(0, BLOCK_N)
         padding_mask = k_offsets < SEQ_LEN
         # tl.static_print("Backward - padding_mask: ", padding_mask)
