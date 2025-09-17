@@ -1,5 +1,7 @@
 import sys
 import argparse
+import time
+import math
 
 import torch
 import torch.nn.functional as F
@@ -30,7 +32,103 @@ def naive_attention(q, k, v, seq_len, window_size, sink_size):
         attn_mask=create_mask_bool(seq_len, window_size, sink_size, device=q.device),
         enable_gqa=True,
     )
+
+def benchmark_all_passes(triton_func, naive_func, test_params, problem_num):
+    """
+    Utility to benchmark the forward, backward, and combined passes of an attention function
+    and compare it to a PyTorch implementation.
+    """
+    print("\n--- Running Performance Benchmark (Forward, Backward, Combined) ---")
     
+    batch, heads_q, heads_kv, seq_len, dim, window_size, sink_size = test_params
+    
+    if problem_num == 8:
+        config_str = f"B={batch}, Hq={heads_q}, Hkv={heads_kv}, L={seq_len}, D={dim}"
+    elif problem_num == 9:
+        config_str = f"B={batch}, Hq={heads_q}, Hkv={heads_kv}, L={seq_len}, D={dim}, W={window_size}, S={sink_size}"
+    else:
+        raise ValueError(f"Problem {problem_num} not supported for benchmarking")
+        
+    print(f"Benchmark Config: {config_str}")
+
+    q_triton = torch.randn(batch, heads_q, seq_len, dim, device='cuda', dtype=DTYPE, requires_grad=True)
+    k_triton = torch.randn(batch, heads_kv, seq_len, dim, device='cuda', dtype=DTYPE, requires_grad=True)
+    v_triton = torch.randn(batch, heads_kv, seq_len, dim, device='cuda', dtype=DTYPE, requires_grad=True)
+    
+    q_ref = q_triton.clone().detach().requires_grad_(True)
+    k_ref = k_triton.clone().detach().requires_grad_(True)
+    v_ref = v_triton.clone().detach().requires_grad_(True)
+
+    dout = torch.randn(batch, heads_q, seq_len, dim, device='cuda', dtype=DTYPE)
+
+    def _run_benchmark(func, q, k, v):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Warm-up runs
+        for _ in range(5):
+            q.grad = k.grad = v.grad = None
+            o = func()
+            o.backward(dout, retain_graph=True)
+        
+        torch.cuda.synchronize()
+        
+        # Timed runs
+        total_forward_time, total_backward_time = 0, 0
+        num_runs = 20
+        for _ in range(num_runs):
+            q.grad = k.grad = v.grad = None
+            
+            torch.cuda.synchronize()
+            start_forward = time.time()
+            o = func()
+            torch.cuda.synchronize()
+            end_forward = time.time()
+            
+            total_forward_time += (end_forward - start_forward)
+            
+            torch.cuda.synchronize()
+            start_backward = time.time()
+            o.backward(dout, retain_graph=True)
+            torch.cuda.synchronize()
+            end_backward = time.time()
+            
+            total_backward_time += (end_backward - start_backward)
+
+        avg_forward_ms = total_forward_time * 1000 / num_runs
+        avg_backward_ms = total_backward_time * 1000 / num_runs
+        avg_total_ms = (total_forward_time + total_backward_time) * 1000 / num_runs
+        peak_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+        
+        return avg_forward_ms, avg_backward_ms, avg_total_ms, peak_mem_gb
+
+    if problem_num == 8:
+        triton_wrapper = lambda: triton_func(q_triton, k_triton, v_triton, is_causal=True)
+        naive_wrapper = lambda: naive_func(q_ref, k_ref, v_ref, seq_len=seq_len, window_size=seq_len, sink_size=0)
+    elif problem_num == 9:
+        triton_wrapper = lambda: triton_func(q_triton, k_triton, v_triton, window_size=window_size, sink_size=sink_size, is_causal=True)
+        naive_wrapper = lambda: naive_func(q_ref, k_ref, v_ref, seq_len, window_size, sink_size)
+
+    fwd_triton, bwd_triton, total_triton, mem_triton = _run_benchmark(triton_wrapper, q_triton, k_triton, v_triton)
+    fwd_torch, bwd_torch, total_torch, mem_torch = _run_benchmark(naive_wrapper, q_ref, k_ref, v_ref)
+
+    print("\n--- Benchmark Results (Avg Time in ms) ---")
+    print(f"{'Implementation':<20}                  | {'Forward':<15} | {'Backward':<15} | {'Total':<15} | {'Peak Memory (GB)':<20}")
+    print("-" * 90)
+    print(f"{'PyTorch (Naive)':<20}                  | {fwd_torch:<15.4f} | {bwd_torch:<15.4f} | {total_torch:<15.4f} | {mem_torch:<20.4f}")
+    print(f"{'Triton (GQA + SWDA + Attention Sinks)':<20} | {fwd_triton:<15.4f} | {bwd_triton:<15.4f} | {total_triton:<15.4f} | {mem_triton:<20.4f}")
+    print("-" * 90)
+    
+    # Calculate speedups and memory savings
+    fwd_speedup = fwd_torch / fwd_triton if fwd_triton > 0 else float('inf')
+    bwd_speedup = bwd_torch / bwd_triton if bwd_triton > 0 else float('inf')
+    total_speedup = total_torch / total_triton if total_triton > 0 else float('inf')
+    mem_saving = mem_torch / mem_triton if mem_triton > 0 else float('inf')
+
+    print(f"Forward Pass Speedup: Triton is {fwd_speedup:.2f}x faster.")
+    print(f"Backward Pass Speedup: Triton is {bwd_speedup:.2f}x faster.")
+    print(f"Overall Speedup: Triton is {total_speedup:.2f}x faster.")
+    print(f"Memory Savings: Triton uses {mem_saving:.2f}x less memory.")
     
 def check_backward_correctness(triton_func, problem_num):
     test_cases = [
@@ -38,9 +136,11 @@ def check_backward_correctness(triton_func, problem_num):
         (1, 16, 8, 4096, 16, 256, 4),
         (1, 16, 1, 4096, 16, 256, 4),
     ]
+    all_correct = True
     for case in test_cases:
         batch, heads_q, heads_kv, seq_len, dim, window_size, sink_size = case
         
+        print("-" * 50)
         if problem_num == 8:
             print(f"Running test case: batch={batch}, heads_q={heads_q}, heads_kv={heads_kv}, seq_len={seq_len}, dim={dim}")
         elif problem_num == 9:
@@ -63,12 +163,8 @@ def check_backward_correctness(triton_func, problem_num):
         else:
             raise ValueError(f"Problem {problem_num} not supported")
             
-        
         is_forward_correct = torch.allclose(o_ref, o_triton, atol=1e-2, rtol=1e-2)
-        if is_forward_correct:
-            print("✅ Forward Pass Results match")
-        else:
-            print("❌ Forward Pass Results do not match")
+        print(f"✅ Forward Pass Correctness: {'PASSED' if is_forward_correct else 'FAILED'}")
         
         dout = torch.rand_like(o_ref)
         o_ref.backward(dout)
@@ -80,18 +176,17 @@ def check_backward_correctness(triton_func, problem_num):
         is_dq_correct = torch.allclose(dq_ref, dq_flash, atol=5e-2, rtol=5e-2)
         is_dk_correct = torch.allclose(dk_ref, dk_flash, atol=5e-2, rtol=5e-2)
         is_dv_correct = torch.allclose(dv_ref, dv_flash, atol=5e-2, rtol=5e-2)
-        if is_dq_correct:
-            print("✅ Backward Pass Results match on dQ")
-        else:
-            print("❌ Backward Pass Results do not match on dQ")
-        if is_dk_correct:
-            print("✅ Backward Pass Results match on dK")
-        else:
-            print("❌ Backward Pass Results do not match on dK")
-        if is_dv_correct:
-            print("✅ Backward Pass Results match on dV")
-        else:
-            print("❌ Backward Pass Results do not match on dV")
+
+        print(f"✅ Backward Pass dQ Correctness: {'PASSED' if is_dq_correct else 'FAILED'}")
+        print(f"✅ Backward Pass dK Correctness: {'PASSED' if is_dk_correct else 'FAILED'}")
+        print(f"✅ Backward Pass dV Correctness: {'PASSED' if is_dv_correct else 'FAILED'}")
+
+        if not (is_forward_correct and is_dq_correct and is_dk_correct and is_dv_correct):
+            all_correct = False
+
+    if all_correct:
+        print(f"\nAll P{problem_num} correctness tests passed!")
+        benchmark_all_passes(triton_func, naive_attention, test_cases[-1], problem_num)
 
 
 def check_problem_8():
